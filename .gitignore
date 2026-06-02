@@ -1,0 +1,10 @@
+*.fsdb
+*.vcd
+*.vpd
+*.log
+build/
+.cache/
+__pycache__/
+*.pyc
+*.swp
+.DS_Store

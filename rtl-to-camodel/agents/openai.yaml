@@ -1,0 +1,4 @@
+interface:
+  display_name: "RTL to CAModel"
+  short_description: "Migrate RTL into cycle-accurate CModel"
+  default_prompt: "Use $rtl-to-camodel to migrate this RTL module into a cycle-accurate CModel implementation."
