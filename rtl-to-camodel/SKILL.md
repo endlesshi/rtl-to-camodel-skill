@@ -7,7 +7,9 @@ description: Use when migrating RTL design modules into cycle-accurate C++ CMode
 
 ## Purpose
 
-Use this skill to migrate RTL design modules into C++ CModel/CAModel implementations with an explicit timing-fidelity target. The target is always complete RTL functional/protocol equivalence, with cycle-level equivalence required for timing-critical modules and pursued best-effort for scheduling/control modules where BasicModel structure would make strict timing disproportionately costly.
+Use this skill to migrate RTL design modules into C++ CModel/CAModel implementations with an explicit timing-fidelity target. The target is always complete RTL functional/protocol equivalence first, with cycle-level equivalence required for timing-critical modules and pursued best-effort for scheduling/control modules where BasicModel structure would make strict timing disproportionately costly.
+
+Even for `strict-cycle` targets, functional/protocol correctness is the foundation: correct payloads, addresses, routing, queue ownership, backpressure, transaction ordering, and completion ordering must be established before strict cycle deltas are treated as the main problem. A strict replay PASS is not meaningful if it is achieved by masking wrong behavior, dropping packets, mis-modeling ready/valid semantics, or relaxing payload/order checks.
 
 ## Trigger Rules
 
@@ -29,7 +31,7 @@ Do not use this skill for:
 
 Classify the target before planning or reporting:
 
-- `strict-cycle`: default for MXU, ARU, operator datapaths, arithmetic pipelines, memories with visible latency, and any module the user explicitly says must be cycle accurate. Require reset-start replay or equivalent per-cycle proof when available.
+- `strict-cycle`: default for MXU, ARU, operator datapaths, arithmetic pipelines, memories with visible latency, and any module the user explicitly says must be cycle accurate. Require reset-start replay or equivalent per-cycle proof when available, but still fix functional/protocol mismatches before optimizing cycle placement.
 - `timing-close`: default for BIU, SU, schedulers, arbiters, interface aggregators, complex ready/valid control, and modules where BasicModel ports would otherwise add non-RTL latency. Preserve function, protocol ordering, payloads, backpressure intent, and RTL-corresponding structure where practical; document accepted timing deltas.
 - `functional`: use only when the user explicitly allows it. Preserve function and observable protocol behavior, but do not claim cycle timing.
 
@@ -41,6 +43,10 @@ If a module contains both timing-critical datapath and scheduling/control logic,
 - Do not guess about timing, handshake, queue, state-update, or pipeline semantics. Ask the user before writing code if these are unclear.
 - Do not modify the basic model unless the user explicitly authorizes it.
 - Only modify the requested module and migration-required files. Avoid unrelated refactors.
+- Do not let strict-cycle pressure override function: wrong data, wrong address, wrong route, dropped/duplicated packets, missing completions, or invalid ordering are functional bugs, not acceptable timing differences.
+- Do not read an input port before proving the RTL-owned destination FIFO/queue has space. If RTL would leave the packet at the producer-facing boundary, CModel must not hide backpressure by consuming it early.
+- Do not pop an internal FIFO/queue before proving the downstream CModel port can accept the packet. Use peek/check/write/pop ownership whenever RTL holds valid data until acceptance.
+- Do not collapse queued RTL events into a single `bool` if multiple events or done tokens can accumulate before the consumer observes them.
 - Think like hardware: distinguish combinational decisions, old register values, sampled inputs, clock-edge updates, and next-cycle visible state.
 - Prefer CModel module boundaries that correspond to RTL module boundaries. If BasicModel ports would insert non-RTL latency on a ready/valid path, either fuse the affected CModel logic or record the accepted `timing-close` delta and its impact.
 - For any non-strict timing choice, state the reason, affected ports/states, expected user-visible impact, and whether the delta is accepted for the module's timing-fidelity class.
@@ -52,22 +58,52 @@ For a first pass on a module, read the user-specified files plus the closest ava
 
 1. RTL source for the target module and its immediate interfaces.
 2. Existing CModel/CAModel basic model interfaces, ports, queues, and clock/update conventions.
-3. Similar migrated modules already present in the repository.
-4. Relevant tests, dump/replay utilities, timing configuration, and mapping documents.
-5. User-provided design notes or known-difference reports.
+3. The producer and consumer modules around the target, because observable backpressure and packet ownership often depend on both sides.
+4. Similar migrated modules already present in the repository.
+5. RTL parameters/header files and CModel constants that affect functional capacity, including FIFO depths, pack widths, bus widths, issue widths, lane counts, and in-flight task limits.
+6. Relevant tests, dump/replay utilities, timing configuration, and mapping documents.
+7. User-provided design notes or known-difference reports.
 
 If the repository contains `cmodel/make.sh`, inspect it before choosing CModel build, unit test, dump, replay, or timing replay commands.
 
 ## Migration Workflow
 
 1. **Define the boundary**: identify inputs, outputs, clocks/resets, valid/ready signals, queues, memories, control state, data state, and task/transaction ownership.
-2. **Extract RTL timing**: write down what is decided from old state in the current cycle, what is updated on the clock edge, and what becomes visible next cycle.
-3. **Map to CModel structure**: map RTL registers, FIFOs, arbiters, handshakes, and pipeline stages to C++ state and `Clock()` ordering.
-4. **Check timing hazards**: read `references/rtl-camodel-timing-checklist.md` before implementation or review.
-5. **Ask on ambiguity**: if any cycle-affecting behavior remains uncertain, stop and ask the user before editing.
-6. **Implement narrowly**: preserve existing local style and module boundaries; add helpers only when they clarify real hardware behavior.
-7. **Verify with evidence**: run RTL and CModel tests where available; for `strict-cycle`, compare cycle-level behavior, and for `timing-close`, compare function/protocol ordering plus any practical timing checkpoints.
-8. **Report clearly**: summarize function result, cycle timing match/mismatch, commands run, waveform evidence, and residual risk.
+2. **Build the behavior map**: record interface payloads, FIFO depths, push/pop conditions, full/empty behavior, completion token ordering, parameter values, and legal-input assumptions.
+3. **Extract RTL timing**: write down what is decided from old state in the current cycle, what is updated on the clock edge, and what becomes visible next cycle.
+4. **Map to CModel structure**: map RTL registers, FIFOs, arbiters, handshakes, and pipeline stages to C++ state and `Clock()` ordering.
+5. **Classify mismatches**: separate functional/protocol bugs from backpressure bugs, ordering/completion bugs, parameter mismatches, replay harness issues, and timing-only deltas.
+6. **Check timing hazards**: read `references/rtl-camodel-timing-checklist.md` before implementation or review.
+7. **Ask on ambiguity**: if any cycle-affecting behavior remains uncertain, stop and ask the user before editing.
+8. **Implement narrowly**: preserve existing local style and module boundaries; add helpers only when they clarify real hardware behavior.
+9. **Verify with evidence**: run RTL and CModel tests where available; for `strict-cycle`, compare cycle-level behavior after functional/protocol equivalence is established, and for `timing-close`, compare function/protocol ordering plus any practical timing checkpoints.
+10. **Report clearly**: summarize function result, cycle timing match/mismatch, commands run, waveform evidence, and residual risk.
+
+## Behavior-First Alignment Map
+
+Before changing CModel code, write down the behavior map for the affected boundary:
+
+- **Interfaces**: producer, consumer, payload fields/widths, valid/ready or full/empty semantics, and what happens when the receiver cannot accept data.
+- **FIFO/backpressure**: depth, push condition, pop condition, full behavior, empty behavior, same-cycle push/pop behavior, and whether pop is gated by downstream ready/full.
+- **Functional work**: address calculation, alignment, packing/unpacking, routing, arbitration, dispatch width, END/fence/set/wait behavior, legal-input assumptions, and error/unsupported encodings.
+- **Ordering/completion**: done tokens, interrupts, task boundaries, cross-port atomicity, and whether multiple in-flight completions can accumulate.
+- **Parameters**: RTL parameter name/value versus CModel constant name/value for functional capacity and payload shape.
+
+Patch mismatches in this priority order:
+
+1. Prevent data loss, packet duplication, and deadlock.
+2. Fix input consumption, output pop/write atomicity, and visible backpressure semantics.
+3. Fix payload, address, route, and packing/mask semantics.
+4. Fix completion token accumulation and done/task ordering.
+5. Align functional parameters after behavior is understood.
+6. Only then chase timing-only deltas required by the chosen fidelity class.
+
+Common safe CModel patterns:
+
+- Input FIFO full: check capacity first, then read and push. Do not read the port and later discover the internal FIFO is full.
+- Output port full: peek the FIFO front, check downstream space, write, then pop. Do not pop before the downstream write can commit.
+- Completion events: use a queue or counter when RTL can accumulate more than one token; a single `bool` is only valid when RTL also stores only one outstanding event.
+- CAModel-only sideband release/backpressure tokens need explicit RTL justification. Prefer existing port `Full()`/ready behavior when it already represents RTL backpressure.
 
 ## Verification Requirements
 
